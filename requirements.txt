@@ -1,0 +1,7 @@
+python-telegram-bot==22.8
+SQLAlchemy>=2.0,<3.0
+python-dotenv>=1.0,<2.0
+
+tzdata>=2024.1
+
+Pillow>=10.0,<13.0
