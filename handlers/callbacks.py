@@ -1228,6 +1228,24 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         owner_user = is_owner(query.from_user.id, OWNER_ID)
         admin_user = is_admin(session, query.from_user.id, OWNER_ID)
+        # Gate every inline route into the seven country-dependent game sections.
+        # Owner/admin management callbacks use explicit owner:/admin: namespaces and are not affected.
+        country_section_callback = str(data).startswith((
+            "bank:", "bank_", "central_bank_", "hq_", "arsenal_",
+            "metal_mine_", "fuel_refinery_", "exchange:", "exchange_",
+            "shield:", "missile_",
+        ))
+        if country_section_callback and not owner_user and not admin_user:
+            countries = get_user_countries(session, current_user)
+            default_country = get_default_country(session, current_user) if countries else None
+            if not countries:
+                session.commit()
+                await query.answer("🌍 شما هنوز هیچ کشوری ندارید. ابتدا در گروهی با دستور «شروع بازی» یک کشور ایجاد کنید.", show_alert=True)
+                return
+            if default_country is None:
+                session.commit()
+                await query.answer("❌ ابتدا از قسمت تنظیمات بازی یک کشور را به‌عنوان کشور پیش‌فرض انتخاب کنید.", show_alert=True)
+                return
         shutdown_mode = get_bot_shutdown_mode(session)
         if not owner_user:
             blocked = (shutdown_mode == "all" or (shutdown_mode == "admins" and admin_user) or (shutdown_mode == "users" and not admin_user))
@@ -2966,19 +2984,16 @@ async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not is_owner(query.from_user.id, OWNER_ID) and not is_admin(session, query.from_user.id, OWNER_ID):
                     await query.answer("⛔ دسترسی ندارید.", show_alert=True); return
                 target_id, country_id = int(parts[2]), int(parts[3])
+                target = get_user_by_telegram_id(session, target_id)
                 country = session.get(CountryModel, country_id)
-                if country is None or country.id not in {c.id for c in get_user_countries(session, get_user_by_telegram_id(session, target_id))}:
+                if target is None or country is None or country.id not in {c.id for c in get_user_countries(session, target)}:
                     await query.answer("❌ کشور پیدا نشد.", show_alert=True); return
+                # همان پنل مشخصات کامل کشور را که در کنترل‌های کاربر استفاده می‌شود
+                # نمایش می‌دهیم تا اطلاعات پیش از حذف دقیقاً با صفحه جزئیات کشور هماهنگ باشد.
+                country_details, _details_markup = _user_game_country_panel(session, target_id, country_id)
+                if not country_details:
+                    await query.answer("❌ اطلاعات کشور برای نمایش پیدا نشد.", show_alert=True); return
                 await query.answer()
-                # قبل از حذف، مشخصات کامل همان کشور را نمایش می‌دهیم تا ادمین
-                # دقیقاً بداند کدام کشور را در حال حذف است.
-                country_details = country_status(
-                    country,
-                    get_metal_mine_config(session),
-                    get_arsenal_config(session),
-                    _country_shield_status(session, country),
-                    fuel_refinery_config=get_fuel_refinery_config(session),
-                )
                 text = (
                     "🗑️ <b>حذف کشور</b>\n\n"
                     f"{country_details}\n\n"

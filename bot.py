@@ -509,6 +509,26 @@ async def _anti_spam_user(update, context) -> bool:
         # در زمان محدودیت، کلیک‌های ربات نباید پیام/هشدار جدید ایجاد کنند.
         return False
     message = getattr(update, "effective_message", None)
+    # When a rate-limited player replies to the country-name prompt, retain that
+    # reply for the requested 30 seconds, then remove it even though the normal
+    # message handler is short-circuited by anti-spam.
+    if message is not None and getattr(message, "reply_to_message", None) is not None:
+        try:
+            prompt_id = context.user_data.get(f"country_creation_prompt_{int(user.id)}")
+            prompt_chat_id = context.user_data.get(f"__waiting_scope__country_name_pending_{int(user.id)}")
+            replied_id = int(message.reply_to_message.message_id)
+            same_chat = prompt_chat_id is None or int(prompt_chat_id) == int(message.chat_id)
+            if same_chat and prompt_id is not None and int(prompt_id) == replied_id:
+                async def _delete_country_name_after_delay(chat_id, message_id):
+                    import asyncio
+                    await asyncio.sleep(30)
+                    try:
+                        await context.bot.delete_message(chat_id=int(chat_id), message_id=int(message_id))
+                    except Exception:
+                        pass
+                context.application.create_task(_delete_country_name_after_delay(message.chat_id, message.message_id))
+        except Exception:
+            pass
     if message is not None and (getattr(message, "text", "") or "").strip().startswith("/"):
         # دستورات اسلشی نیز در زمان محدودیت بدون پاسخ رد می‌شوند.
         return False

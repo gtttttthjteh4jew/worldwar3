@@ -916,11 +916,9 @@ def owner_backup_list_keyboard(records, page: int, total_pages: int):
     nav = []
     if page > 1:
         nav.append(InlineKeyboardButton("⬅️ قبلی", callback_data=f"owner:backup_list:{page - 1}"))
-        nav.append(InlineKeyboardButton("⏪ ۱۰ صفحه قبلی", callback_data=f"owner:backup_list:{max(1, page - 10)}"))
     nav.append(InlineKeyboardButton(f"صفحه {page}/{total_pages}", callback_data="owner:noop"))
     if page < total_pages:
         nav.append(InlineKeyboardButton("بعدی ➡️", callback_data=f"owner:backup_list:{page + 1}"))
-        nav.append(InlineKeyboardButton("۱۰ صفحه بعدی ⏩", callback_data=f"owner:backup_list:{min(total_pages, page + 10)}"))
     if nav:
         rows.append(nav)
     rows.append([InlineKeyboardButton("🔙 برگشت", callback_data="owner:security_backup")])

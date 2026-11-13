@@ -331,8 +331,29 @@ class ProductInventory(Base):
     product_category: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
     payload_json: Mapped[str] = mapped_column(Text, nullable=False)
     paid_amount: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    # Immutable checkout snapshot; catalog edits never change old purchases.
+    base_price: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    discount_percent: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    discount_amount: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
     status: Mapped[str] = mapped_column(String(24), default="available", nullable=False, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+
+class ProductStock(Base):
+    """Aggregated user-owned store inventory, independent from purchase history."""
+    __tablename__ = "product_stock"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(BigInteger, ForeignKey("users.telegram_id"), index=True)
+    stock_key: Mapped[str] = mapped_column(String(160), nullable=False)
+    product_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    product_category: Mapped[str] = mapped_column(String(48), nullable=False, index=True)
+    amount: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    unit: Mapped[str] = mapped_column(String(32), nullable=False, default="واحد")
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (UniqueConstraint("user_id", "stock_key", name="uq_product_stock_user_key"),)
 
 
 class BackupRecord(Base):

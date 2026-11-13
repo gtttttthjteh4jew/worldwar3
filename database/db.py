@@ -191,6 +191,58 @@ def _repair_country_legacy_fk_targets(conn):
     conn.exec_driver_sql("PRAGMA foreign_keys=ON")
 
 
+def _repair_user_legacy_fk_targets(conn):
+    """Repair child tables that SQLite rewrote to REFERENCES users_legacy."""
+    broken = conn.exec_driver_sql(
+        "SELECT name, sql FROM sqlite_master WHERE type='table' "
+        "AND name NOT LIKE 'sqlite_%' AND sql LIKE '%users_legacy%'"
+    ).fetchall()
+    if not broken:
+        return
+
+    conn.exec_driver_sql("PRAGMA foreign_keys=OFF")
+    conn.exec_driver_sql("PRAGMA legacy_alter_table=ON")
+    for table_name, create_sql in broken:
+        if not create_sql:
+            continue
+        temp_name = f"__ww3_user_fkfix_{table_name}"
+        quoted_table = '"' + str(table_name).replace('"', '""') + '"'
+        quoted_temp = '"' + temp_name.replace('"', '""') + '"'
+        dependents = conn.exec_driver_sql(
+            "SELECT type, sql FROM sqlite_master WHERE tbl_name=? "
+            "AND type IN ('index','trigger') AND sql IS NOT NULL",
+            (table_name,),
+        ).fetchall()
+        info = conn.exec_driver_sql(f"PRAGMA table_info({quoted_table})").fetchall()
+        columns = [row[1] for row in info]
+        if not columns:
+            continue
+        col_sql = ", ".join('"' + c.replace('"', '""') + '"' for c in columns)
+        match = re.match(
+            r'(?is)^(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?)(?:"([^"]+)"|`([^`]+)`|\[([^]]+)\]|([^\s(]+))',
+            str(create_sql),
+        )
+        if not match:
+            continue
+        replacement = match.group(1) + quoted_temp
+        temp_sql = str(create_sql[:match.start()]) + replacement + str(create_sql[match.end():])
+        temp_sql = temp_sql.replace('users_legacy', 'users')
+        conn.exec_driver_sql(f"DROP TABLE IF EXISTS {quoted_temp}")
+        conn.exec_driver_sql(temp_sql)
+        conn.exec_driver_sql(
+            f"INSERT INTO {quoted_temp} ({col_sql}) SELECT {col_sql} FROM {quoted_table}"
+        )
+        conn.exec_driver_sql(f"DROP TABLE {quoted_table}")
+        conn.exec_driver_sql(f"ALTER TABLE {quoted_temp} RENAME TO {quoted_table}")
+        for _typ, sql in dependents:
+            try:
+                conn.exec_driver_sql(sql)
+            except Exception:
+                pass
+    conn.exec_driver_sql("PRAGMA legacy_alter_table=OFF")
+    conn.exec_driver_sql("PRAGMA foreign_keys=ON")
+
+
 def _migrate_country_schema(conn):
     """Rebuild countries plus dependent FK tables when economic columns need REAL or legacy UNIQUE(chat_id) exists."""
     cols = {row[1]: row[2].upper() for row in conn.exec_driver_sql("PRAGMA table_info(countries)").fetchall()}
@@ -408,6 +460,18 @@ def init_db():
     Base.metadata.create_all(bind=engine)
 
     with engine.begin() as conn:
+        # Additive, backwards-compatible purchase-history columns. Older product_inventory
+        # rows are retained and receive a zero-discount snapshot from their paid amount.
+        product_columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(product_inventory)").fetchall()}
+        for name, ddl in {
+            "base_price": "BIGINT NOT NULL DEFAULT 0",
+            "discount_percent": "REAL NOT NULL DEFAULT 0",
+            "discount_amount": "BIGINT NOT NULL DEFAULT 0",
+        }.items():
+            if name not in product_columns:
+                conn.exec_driver_sql(f"ALTER TABLE product_inventory ADD COLUMN {name} {ddl}")
+        conn.exec_driver_sql("UPDATE product_inventory SET base_price = paid_amount WHERE base_price IS NULL OR base_price = 0")
+        conn.exec_driver_sql("UPDATE product_inventory SET discount_amount = MAX(0, base_price - paid_amount) WHERE discount_amount IS NULL OR (discount_amount = 0 AND base_price > paid_amount)")
         user_columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(users)").fetchall()}
         if "last_name" not in user_columns:
             conn.exec_driver_sql("ALTER TABLE users ADD COLUMN last_name VARCHAR(255)")
@@ -550,6 +614,10 @@ def init_db():
         conn.exec_driver_sql("UPDATE countries SET leader_name = COALESCE(NULLIF(TRIM(leader_name), ''), 'نامشخص') WHERE leader_name IS NULL OR TRIM(leader_name) = ''")
 
         _migrate_country_schema(conn)
+        # SQLite may rewrite references to users_legacy while the legacy country
+        # schema rebuild renames users. Repair all child-table references before
+        # the bot starts writing purchase history or aggregate product stock.
+        _repair_user_legacy_fk_targets(conn)
         # The rebuild above targets older schemas. Re-ensure every additive column
         # after the rebuild so newer fields can never disappear.
         _ensure_missing_columns(conn)

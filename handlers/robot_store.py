@@ -7,14 +7,14 @@ import uuid
 from datetime import datetime
 from html import escape
 
-from sqlalchemy import select, update
+from sqlalchemy import select, update, func
 from sqlalchemy.exc import IntegrityError
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from config import OWNER_ID
 from database.db import SessionLocal
-from database.models import BotSetting, ProductInventory, User, Wallet
+from database.models import BotSetting, ProductInventory, ProductStock, User, Wallet, Country, UserCountry, BankAccount
 from services.wallet import ensure_wallet, get_bool, WALLET_ENABLED, format_amount
 from services.economy import get_missiles_config
 from services.construction_teams import get_construction_teams_config
@@ -49,6 +49,103 @@ def _markup(rows):
     return InlineKeyboardMarkup(rows)
 
 
+def _discounted_price(base_price, percent):
+    base = max(0, int(base_price or 0))
+    pct = max(0.0, min(100.0, float(percent or 0)))
+    amount = min(base, int(round(base * pct / 100.0)))
+    return base - amount, amount
+
+
+def _discount_text(base_price, percent):
+    base = max(0, int(base_price or 0))
+    final, amount = _discounted_price(base, percent)
+    pct = max(0.0, min(100.0, float(percent or 0)))
+    if pct <= 0 or amount <= 0:
+        return f"💰 قیمت اصلی: <b>{base:,} تومان</b>\n✅ قیمت نهایی: <b>{final:,} تومان</b>"
+    return (f"💰 قیمت اصلی: <s>{base:,} تومان</s>\n"
+            f"🏷️ میزان تخفیف: <b>{pct:g}٪</b>\n"
+            f"💸 مبلغ تخفیف: <b>{amount:,} تومان</b>\n"
+            f"✅ قیمت نهایی: <b>{final:,} تومان</b>")
+
+
+def _stock_entries(payload):
+    """Expand a single item or a bundle into transferable stock units."""
+    if not isinstance(payload, dict):
+        return []
+    kind = str(payload.get("kind") or "")
+    components = payload.get("components") if kind in {"bundle", "event"} else [payload]
+    entries = []
+    for comp in components or []:
+        if not isinstance(comp, dict):
+            continue
+        ck = str(comp.get("kind") or "")
+        if ck == "resource" and comp.get("resource") in RESOURCE_ORDER:
+            resource = str(comp["resource"])
+            entries.append({"key": f"resource:{resource}", "name": RESOURCE_LABELS[resource], "category": "resources", "amount": float(comp.get("amount", 0) or 0), "unit": "واحد", "payload": {"kind": "resource", "resource": resource}})
+        elif ck == "population":
+            entries.append({"key": "population", "name": "👥 شهروند", "category": "population", "amount": float(comp.get("amount", 0) or 0), "unit": "نفر", "payload": {"kind": "population"}})
+        elif ck == "leadership":
+            entries.append({"key": "leadership", "name": "👑 تجربه رهبری", "category": "leadership", "amount": float(comp.get("amount", 0) or 0), "unit": "واحد تجربه", "payload": {"kind": "leadership"}})
+        elif ck == "shield" and comp.get("shield_type") in {"global", "continental"}:
+            typ = str(comp["shield_type"])
+            entries.append({"key": f"shield:{typ}", "name": SHIELD_LABELS[typ], "category": "shields", "amount": float(comp.get("hours", comp.get("duration_hours", 0)) or 0), "unit": "ساعت", "payload": {"kind": "shield", "shield_type": typ}})
+        elif ck == "missile" and comp.get("missile_id") is not None:
+            mid = str(comp.get("missile_id"))
+            level = max(1, int(comp.get("level", 1) or 1))
+            entries.append({"key": f"missile:{mid}:{level}", "name": f"🚀 {comp.get('missile_name') or 'موشک'} — سطح {level}", "category": "missiles", "amount": float(comp.get("quantity", 0) or 0), "unit": "عدد", "payload": {"kind": "missile", "missile_id": mid, "missile_name": str(comp.get("missile_name") or "موشک"), "level": level}})
+        elif ck == "team" and comp.get("team_number") is not None:
+            team_number = max(2, int(comp.get("team_number", 0) or 0))
+            entries.append({"key": f"team:{team_number}", "name": f"🏗️ تیم ساخت‌وساز {team_number}", "category": "teams", "amount": 1.0, "unit": "تیم", "payload": {"kind": "team", "team_number": team_number}})
+    return [x for x in entries if x["amount"] > 0]
+
+
+def _add_payload_to_stock(session, user_id, payload):
+    """Add purchased quantities to one aggregate row per user/product variant."""
+    for entry in _stock_entries(payload):
+        stock = session.scalar(select(ProductStock).where(
+            ProductStock.user_id == int(user_id), ProductStock.stock_key == entry["key"]
+        ))
+        if stock is None:
+            stock = ProductStock(
+                user_id=int(user_id), stock_key=entry["key"], product_name=entry["name"],
+                product_category=entry["category"], amount=0.0, unit=entry["unit"],
+                payload_json=json.dumps(entry["payload"], ensure_ascii=False),
+            )
+            session.add(stock)
+        stock.amount = float(stock.amount or 0) + float(entry["amount"])
+        stock.product_name = entry["name"]
+        stock.unit = entry["unit"]
+        stock.payload_json = json.dumps(entry["payload"], ensure_ascii=False)
+    session.flush()
+
+
+def _migrate_legacy_bag(session):
+    """One-time migration of old per-purchase bag rows to aggregate stock."""
+    key = "robot_store_legacy_bag_migrated_v1"
+    marker = session.scalar(select(BotSetting).where(BotSetting.key == key))
+    if marker is not None:
+        return
+    rows = session.scalars(select(ProductInventory).where(ProductInventory.status == "available").order_by(ProductInventory.id)).all()
+    for item in rows:
+        try:
+            _add_payload_to_stock(session, int(item.user_id), json.loads(item.payload_json or "{}"))
+        except Exception:
+            # Keep the immutable purchase history even if a legacy payload is unsupported.
+            continue
+    session.add(BotSetting(key=key, value="1"))
+    session.flush()
+
+
+def _country_access_error(session, user):
+    from services.game import get_user_countries, get_default_country
+    countries = get_user_countries(session, user)
+    if not countries:
+        return "🌍 شما هنوز هیچ کشوری ندارید. ابتدا در گروهی با دستور «شروع بازی» یک کشور ایجاد کنید."
+    if get_default_country(session, user) is None:
+        return "❌ ابتدا از قسمت تنظیمات بازی یک کشور را به‌عنوان کشور پیش‌فرض انتخاب کنید."
+    return None
+
+
 def _uid_cb(uid, *parts):
     return "rs:u:{}:{}".format(int(uid), ":".join(str(x) for x in parts))
 
@@ -64,6 +161,7 @@ def _default_quantity_config(minimum=1):
         "unit_price": 0,
         "min": minimum,
         "max": 0,
+        "discount_percent": 0,
         "plans": [],
     }
 
@@ -110,8 +208,12 @@ def _catalog(session):
             else:
                 for field, default in value.items():
                     current.setdefault(field, default)
+                current.setdefault("discount_percent", 0)
                 if not isinstance(current.get("plans"), list):
                     current["plans"] = []
+                for plan in current["plans"]:
+                    if isinstance(plan, dict):
+                        plan.setdefault("discount_percent", 0)
     for section in ("population", "leadership"):
         value = data.setdefault(section, dict(defaults[section]))
         if not isinstance(value, dict):
@@ -119,8 +221,12 @@ def _catalog(session):
         else:
             for field, default in defaults[section].items():
                 value.setdefault(field, default)
+            value.setdefault("discount_percent", 0)
             if not isinstance(value.get("plans"), list):
                 value["plans"] = []
+            for plan in value["plans"]:
+                if isinstance(plan, dict):
+                    plan.setdefault("discount_percent", 0)
 
     missiles = data.setdefault("missiles", {})
     if not isinstance(missiles, dict):
@@ -140,8 +246,12 @@ def _catalog(session):
         conf.setdefault("min", 1)
         conf.setdefault("max", 0)
         conf.setdefault("plans", [])
+        conf.setdefault("discount_percent", 0)
         if not isinstance(conf.get("plans"), list):
             conf["plans"] = []
+        for plan in conf["plans"]:
+            if isinstance(plan, dict):
+                plan.setdefault("discount_percent", 0)
         had_level_config = isinstance(conf.get("levels"), dict)
         levels = conf.setdefault("levels", {})
         if not isinstance(levels, dict):
@@ -166,8 +276,12 @@ def _catalog(session):
             level_conf.setdefault("min", 1)
             level_conf.setdefault("max", 0)
             level_conf.setdefault("plans", [])
+            level_conf.setdefault("discount_percent", 0)
             if not isinstance(level_conf.get("plans"), list):
                 level_conf["plans"] = []
+            for plan in level_conf["plans"]:
+                if isinstance(plan, dict):
+                    plan.setdefault("discount_percent", 0)
 
     data.setdefault("teams", {})
     if not isinstance(data["teams"], dict):
@@ -181,10 +295,14 @@ def _catalog(session):
         else:
             conf.setdefault("enabled", False)
             conf.setdefault("price", 0)
+            conf.setdefault("discount_percent", 0)
 
     products = data.setdefault("custom_products", [])
     if not isinstance(products, list):
         data["custom_products"] = []
+    for product in data.get("custom_products", []):
+        if isinstance(product, dict):
+            product.setdefault("discount_percent", 0)
     row.value = json.dumps(data, ensure_ascii=False)
     session.flush()
     return data
@@ -206,6 +324,7 @@ def _user_keyboard(uid):
         [_btn("👑 تجربه رهبری", _uid_cb(uid, "cat", "leadership")), _btn("🛡️ سپر", _uid_cb(uid, "cat", "shields"))],
         [_btn("🚀 موشک‌ها", _uid_cb(uid, "cat", "missiles")), _btn("🏗️ تیم ساخت‌وساز", _uid_cb(uid, "cat", "teams"))],
         [_btn("📦 محصولات ترکیبی", _uid_cb(uid, "cat", "bundles")), _btn("🎉 محصولات مناسبتی", _uid_cb(uid, "cat", "events"))],
+        [_btn("📜 تاریخچه خریدها", _uid_cb(uid, "history"))],
     ]
     return _markup(rows)
 
@@ -318,14 +437,21 @@ def _category_owner_keyboard(category, data, session):
 def _config_text(category, key, conf, title):
     enabled = "فعال" if conf.get("enabled") else "غیرفعال"
     lines = [f"⚙️ <b>{escape(title)}</b>", "", f"وضعیت فروش: <b>{enabled}</b>"]
+    price_field = "price" if category == "teams" else "unit_price"
+    base = int(conf.get(price_field, 0) or 0)
+    pct = float(conf.get("discount_percent", 0) or 0)
+    final, discount = _discounted_price(base, pct)
     if category == "teams":
-        lines.append(f"💰 قیمت خرید: <b>{int(conf.get('price', 0) or 0):,} تومان</b>")
+        lines.extend([_discount_text(base, pct)])
     else:
         if category in {"missiles", "missile_level"}:
-            lines.append(f"💰 قیمت هر موشک: <b>{int(conf.get('unit_price', 0) or 0):,} تومان</b>")
+            amount_label = "هر موشک"
         else:
-            amount_label = "ساعت" if category == "shields" else ("واحد" if category == "resources" else ("شهروند" if category == "population" else "واحد تجربه"))
-            lines.append(f"💰 قیمت هر <b>{int(conf.get('unit_amount', 1) or 1):,} {amount_label}</b>: <b>{int(conf.get('unit_price', 0) or 0):,} تومان</b>")
+            amount_label = "هر ساعت" if category == "shields" else ("هر شهروند" if category == "population" else ("هر واحد تجربه" if category == "leadership" else "هر واحد"))
+        lines.extend([f"💰 قیمت پایه {amount_label}: <b>{base:,} تومان</b>"])
+        if pct > 0 and discount > 0:
+            lines.extend([f"🏷️ تخفیف: <b>{pct:g}٪</b>", f"💸 مبلغ تخفیف: <b>{discount:,} تومان</b>"])
+        lines.append(f"✅ قیمت نهایی {amount_label}: <b>{final:,} تومان</b>")
         lines.append(f"📉 حداقل خرید دلخواه: <b>{conf.get('min', 1)}</b>")
         maximum = int(conf.get("max", 0) or 0)
         lines.append(f"📈 حداکثر خرید دلخواه: <b>{format_amount(maximum) if maximum else 'بدون سقف'}</b>")
@@ -347,6 +473,9 @@ def _config_keyboard(category, key, conf):
             rows.append([_btn("🔢 تعیین مقدار واحد", _owner_cb("set", category, key, "unit_amount")), _btn("💵 تنظیم قیمت", _owner_cb("set", category, key, "unit_price"))])
         rows.append([_btn("📉 حداقل خرید", _owner_cb("set", category, key, "min")), _btn("📈 حداکثر خرید", _owner_cb("set", category, key, "max"))])
         rows.append([_btn("📋 مدیریت پلن‌ها", _owner_cb("plans", category, key, 1))])
+    rows.append([_btn("🏷️ تنظیم درصد تخفیف", _owner_cb("set", category, key, "discount_percent"))])
+    if float(conf.get("discount_percent", 0) or 0) > 0:
+        rows.append([_btn("❌ حذف تخفیف", _owner_cb("discount_remove", category, key), "danger")])
     if category in {"population", "leadership"}:
         back_callback = _owner_cb("home")
     elif category == "missile_level":
@@ -415,24 +544,29 @@ def _plan_management_keyboard(category, key, conf):
 def _plan_text(conf, plan, title):
     amount = plan.get("amount", 0)
     unit = "ساعت" if title in {SHIELD_LABELS["global"], SHIELD_LABELS["continental"]} else ("شهروند" if title == "👥 شهروند" else ("واحد تجربه" if title == "👑 تجربه رهبری" else ("موشک" if "موشک" in title else "واحد")))
+    base = int(plan.get("price", 0) or 0)
     return (f"📋 <b>{escape(str(plan.get('name') or 'پلن'))}</b>\n\n"
             f"📦 مقدار: <b>{amount:,} {unit}</b>\n"
-            f"💰 قیمت: <b>{int(plan.get('price', 0) or 0):,} تومان</b>\n"
+            f"{_discount_text(base, plan.get('discount_percent', 0))}\n"
             f"وضعیت: <b>{'فعال' if plan.get('enabled', True) else 'غیرفعال'}</b>")
 
 
 def _plan_detail_keyboard(category, key, plan, page=1):
     pid = str(plan.get("id"))
     enabled = bool(plan.get("enabled", True))
-    return _markup([
+    rows = [
         [_btn("✏️ ویرایش نام", _owner_cb("plan_set", category, key, pid, "name", page))],
         [_btn("🔢 ویرایش مقدار", _owner_cb("plan_set", category, key, pid, "amount", page)), _btn("💰 ویرایش قیمت", _owner_cb("plan_set", category, key, pid, "price", page))],
-        [
-            _btn("🗑 حذف پلن", _owner_cb("plan_delete", category, key, pid, page), "danger"),
-            _btn("🔴 غیرفعال کردن" if enabled else "🟢 فعال کردن", _owner_cb("plan_toggle", category, key, pid, page), "danger" if enabled else "success"),
-        ],
+        [_btn("🏷️ تنظیم درصد تخفیف", _owner_cb("plan_set", category, key, pid, "discount_percent", page))],
+    ]
+    if float(plan.get("discount_percent", 0) or 0) > 0:
+        rows.append([_btn("❌ حذف تخفیف", _owner_cb("plan_discount_remove", category, key, pid, page), "danger")])
+    rows.extend([
+        [_btn("🗑 حذف پلن", _owner_cb("plan_delete", category, key, pid, page), "danger"),
+         _btn("🔴 غیرفعال کردن" if enabled else "🟢 فعال کردن", _owner_cb("plan_toggle", category, key, pid, page), "danger" if enabled else "success")],
         [_btn("🔙 برگشت به لیست پلن‌ها", _owner_cb("plan_list", category, key, page), "danger")],
     ])
+    return _markup(rows)
 
 
 def _custom_components_text(product):
@@ -444,7 +578,7 @@ def _custom_components_text(product):
         f"📦 <b>{escape(str(product.get('name') or 'محصول'))}</b>",
         f"📝 توضیحات: <b>{escape(description) if description else 'بدون توضیحات'}</b>",
         f"💎 قیمت واقعی محصولات: <b>{original_price:,} تومان</b>",
-        f"🎁 قیمت بسته: <b>{package_price:,} تومان</b>",
+        f"{_discount_text(package_price, product.get('discount_percent', 0))}",
     ]
     if product.get("kind") == "event":
         lines.append(f"🔔 اعلان به کاربران: <b>{'فعال' if product.get('announce', False) else 'غیرفعال'}</b>")
@@ -499,15 +633,21 @@ def _custom_builder_keyboard(product, *, is_new):
 
 def _custom_detail_keyboard(product):
     enabled = bool(product.get("enabled", True))
-    return _markup([
+    rows = [
         [_btn("🧩 مشاهده و ویرایش محتویات", _owner_cb("edit_components", product.get("id")))],
         [_btn("✏️ تغییر نام", _owner_cb("custom_set", product.get("id"), "name"))],
         [_btn("💰 قیمت واقعی / قیمت بسته", _owner_cb("custom_set_price", product.get("id")))],
+        [_btn("🏷️ تنظیم درصد تخفیف", _owner_cb("custom_set", product.get("id"), "discount_percent"))],
+    ]
+    if float(product.get("discount_percent", 0) or 0) > 0:
+        rows.append([_btn("❌ حذف تخفیف", _owner_cb("custom_discount_remove", product.get("id")), "danger")])
+    rows.extend([
         [_btn("📝 تغییر توضیحات", _owner_cb("custom_set", product.get("id"), "description"))],
         [_btn("🔴 غیرفعال کردن" if enabled else "🟢 فعال کردن", _owner_cb("custom_toggle", product.get("id")), "danger" if enabled else "success")],
         [_btn("🗑 حذف محصول", _owner_cb("custom_delete", product.get("id")), "danger")],
         [_btn("🔙 برگشت", _owner_cb("category", "bundles" if product.get("kind") == "bundle" else "events"), "danger")],
     ])
+    return _markup(rows)
 
 
 def _format_payload(payload):
@@ -560,6 +700,10 @@ def _register(query):
 
 
 async def open_user_store(message, context, session, user):
+    error = _country_access_error(session, user)
+    if error:
+        await message.reply_text(error)
+        return
     catalog = _catalog(session)
     if not catalog.get("enabled", True):
         # فروشگاه غیرفعال نباید هیچ پنل یا دکمه‌ای برای کاربر باز کند.
@@ -582,12 +726,18 @@ async def open_product_bag(message, context, session, user, page=1):
 
 
 async def _send_bag_page(message_or_query, context, session, user_id, page, reply=False):
+    _migrate_legacy_bag(session)
     page = max(1, int(page or 1))
     per_page = 8
-    total = int(session.scalar(select(__import__('sqlalchemy').func.count(ProductInventory.id)).where(ProductInventory.user_id == int(user_id))) or 0)
+    total = int(session.scalar(select(func.count(ProductStock.id)).where(
+        ProductStock.user_id == int(user_id), ProductStock.amount > 0
+    )) or 0)
     pages = max(1, (total + per_page - 1) // per_page)
     page = min(page, pages)
-    rows = list(session.scalars(select(ProductInventory).where(ProductInventory.user_id == int(user_id)).order_by(ProductInventory.created_at.desc(), ProductInventory.id.desc()).offset((page - 1) * per_page).limit(per_page)).all())
+    rows = list(session.scalars(select(ProductStock).where(
+        ProductStock.user_id == int(user_id), ProductStock.amount > 0
+    ).order_by(ProductStock.product_category, ProductStock.product_name, ProductStock.id)
+     .offset((page - 1) * per_page).limit(per_page)).all())
     if total == 0:
         empty_text = "❌ هیچ محصولی در کیف محصولات موجود نیست."
         if hasattr(message_or_query, "answer"):
@@ -595,14 +745,12 @@ async def _send_bag_page(message_or_query, context, session, user_id, page, repl
         else:
             await message_or_query.reply_text(empty_text)
         return
-    lines = ["🎒 <b>کیف محصولات</b>", "━━━━━━━━━━━━━━━━━━", f"📦 تعداد خریدهای نگهداری‌شده: <b>{total}</b>", ""]
+    lines = ["🎒 <b>کیف محصولات</b>", "━━━━━━━━━━━━━━━━━━", f"📦 تعداد انواع موجودی: <b>{total}</b>", ""]
     buttons = []
-    if not rows:
-        lines.append("هنوز محصولی خریداری نکرده‌اید.")
-    else:
-        for item in rows:
-            lines.append(f"• <b>{escape(item.product_name)}</b> — {int(item.paid_amount):,} تومان")
-            buttons.append([_btn(f"📦 {item.product_name[:34]}", _uid_cb(user_id, "bagitem", item.id, page))])
+    for item in rows:
+        amount = int(item.amount) if float(item.amount).is_integer() else round(float(item.amount), 2)
+        lines.append(f"• <b>{escape(item.product_name)}</b>: <b>{amount:,} {escape(item.unit)}</b>")
+        buttons.append([_btn(f"📦 {item.product_name[:30]} | {amount:,}", _uid_cb(user_id, "stockitem", item.id, page))])
     nav = []
     if page > 1:
         nav.append(_btn("◀️ قبلی", _uid_cb(user_id, "bag", page - 1)))
@@ -621,6 +769,70 @@ async def _send_bag_page(message_or_query, context, session, user_id, page, repl
         await message_or_query.answer()
         await _edit(message_or_query, text, markup)
         _register(message_or_query)
+
+
+async def _user_history_page(query, uid, session, page=1):
+    _migrate_legacy_bag(session)
+    page = max(1, int(page or 1))
+    per_page = 8
+    total = int(session.scalar(select(func.count(ProductInventory.id)).where(ProductInventory.user_id == int(uid))) or 0)
+    if total <= 0:
+        await query.answer("📭 هنوز خریدی برای شما ثبت نشده است.", show_alert=True)
+        return
+    pages = max(1, (total + per_page - 1) // per_page)
+    page = min(page, pages)
+    purchases = list(session.scalars(select(ProductInventory).where(
+        ProductInventory.user_id == int(uid)
+    ).order_by(ProductInventory.created_at.desc(), ProductInventory.id.desc())
+     .offset((page - 1) * per_page).limit(per_page)).all())
+    lines = ["📜 <b>تاریخچه خریدهای شما</b>", "━━━━━━━━━━━━━━━━━━",
+             f"تعداد کل خریدها: <b>{total:,}</b>", f"صفحه: <b>{page}/{pages}</b>", ""]
+    buttons = []
+    for purchase in purchases:
+        created = purchase.created_at.strftime("%Y/%m/%d — %H:%M") if purchase.created_at else "ثبت نشده"
+        lines.append(f"• <b>{escape(purchase.product_name)}</b> — {int(purchase.paid_amount):,} تومان | {created}")
+        buttons.append([_btn(f"📦 {purchase.product_name[:25]} — {int(purchase.paid_amount):,}",
+                             _uid_cb(uid, "history_item", purchase.id, page))])
+    nav = []
+    if page > 1:
+        nav.append(_btn("◀️ قبلی", _uid_cb(uid, "history_page", page - 1)))
+    nav.append(_btn(f"{page}/{pages}", _uid_cb(uid, "noop")))
+    if page < pages:
+        nav.append(_btn("بعدی ▶️", _uid_cb(uid, "history_page", page + 1)))
+    if nav:
+        buttons.append(nav)
+    buttons.append([_btn("🔙 برگشت به فروشگاه", _uid_cb(uid, "home"), "danger")])
+    await query.answer()
+    await _edit(query, "\n".join(lines), _markup(buttons))
+    _register(query)
+
+
+async def _user_purchase_detail(query, uid, purchase_id, page, session):
+    item = session.scalar(select(ProductInventory).where(
+        ProductInventory.id == int(purchase_id), ProductInventory.user_id == int(uid)
+    ))
+    if item is None:
+        await query.answer("❌ خرید پیدا نشد.", show_alert=True)
+        return
+    try:
+        payload = json.loads(item.payload_json or "{}")
+    except Exception:
+        payload = {}
+    created = item.created_at.strftime("%Y/%m/%d — %H:%M") if item.created_at else "ثبت نشده"
+    base_price = int(getattr(item, "base_price", 0) or item.paid_amount or 0)
+    pct = float(getattr(item, "discount_percent", 0) or 0)
+    discount = int(getattr(item, "discount_amount", 0) or 0)
+    text = ("📜 <b>جزئیات خرید</b>\n━━━━━━━━━━━━━━━━━━\n"
+            f"📦 محصول یا پلن: <b>{escape(item.product_name)}</b>\n"
+            f"📦 محتویات: {_format_payload(payload)}\n"
+            f"📅 تاریخ خرید: <b>{created}</b>\n"
+            f"💰 قیمت اصلی: <b>{base_price:,} تومان</b>\n"
+            f"🏷️ درصد تخفیف: <b>{pct:g}٪</b>\n"
+            f"💸 مبلغ تخفیف: <b>{discount:,} تومان</b>\n"
+            f"✅ مبلغ پرداخت‌شده: <b>{int(item.paid_amount):,} تومان</b>")
+    await query.answer()
+    await _edit(query, text, _markup([[_btn("🔙 برگشت به تاریخچه", _uid_cb(uid, "history_page", page), "danger")]]))
+    _register(query)
 
 
 async def _user_home(query, uid, session):
@@ -676,12 +888,18 @@ def _user_category_keyboard(uid, category, data, session):
         for number in range(2, max(1, min(10, int(team_cfg.get("max_teams", 10) or 10))) + 1):
             conf = data.get("teams", {}).get(str(number), {})
             if conf.get("enabled") and int(conf.get("price", 0) or 0) > 0:
-                rows.append([_btn(f"🏗️ تیم ساخت‌وساز {number} — {int(conf.get('price', 0)):,.0f} تومان", _uid_cb(uid, "team", number))])
+                final_price, _ = _discounted_price(conf.get("price", 0), conf.get("discount_percent", 0))
+                pct = float(conf.get("discount_percent", 0) or 0)
+                label = f"{final_price:,} تومان" + (f" ({pct:g}٪ تخفیف)" if pct > 0 else "")
+                rows.append([_btn(f"🏗️ تیم ساخت‌وساز {number} — {label}", _uid_cb(uid, "team", number))])
     elif category in {"bundles", "events"}:
         kind = "bundle" if category == "bundles" else "event"
         for product in data.get("custom_products", []):
             if product.get("kind") == kind and product.get("enabled", True) and int(product.get("price", 0) or 0) > 0:
-                rows.append([_btn(f"{product.get('name', 'محصول')[:40]} — {int(product.get('price', 0) or 0):,} تومان", _uid_cb(uid, "custom_product", product.get("id")))])
+                final_price, _ = _discounted_price(product.get("price", 0), product.get("discount_percent", 0))
+                pct = float(product.get("discount_percent", 0) or 0)
+                price_label = f"{final_price:,} تومان" + (f" ({pct:g}٪ تخفیف)" if pct > 0 else "")
+                rows.append([_btn(f"{product.get('name', 'محصول')[:40]} — {price_label}", _uid_cb(uid, "custom_product", product.get("id")))])
     rows.append([_btn("🔙 برگشت به فروشگاه", _uid_cb(uid, "home"), "danger")])
     return _markup(rows)
 
@@ -1008,7 +1226,7 @@ async def _owner_custom_detail(query, session, product_id):
     kind_label = "محصول ترکیبی" if product.get("kind") == "bundle" else "محصول مناسبتی"
     lines = [f"🛍️ <b>{escape(kind_label)}</b>", f"📦 نام: <b>{escape(str(product.get('name', '')))}</b>",
              f"💎 قیمت واقعی محصولات: <b>{int(product.get('original_price', 0) or 0):,} تومان</b>",
-             f"🎁 قیمت بسته: <b>{int(product.get('price', 0) or 0):,} تومان</b>",
+             f"{_discount_text(product.get('price', 0), product.get('discount_percent', 0))}",
              f"وضعیت: <b>{'فعال' if product.get('enabled', True) else 'غیرفعال'}</b>", "",
              f"📝 توضیحات: {escape(str(product.get('description') or 'ثبت نشده'))}", "",
              "<b>محتویات:</b>"]
@@ -1161,7 +1379,10 @@ async def _owner_sale_detail(query, session, sale_id, back_kind="resources", bac
             f"📦 محصول: <b>{escape(item.product_name)}</b>\n"
             f"👤 خریدار: <b>{escape(str(buyer_name))}</b>\n"
             f"🆔 آیدی تلگرام: <code>{int(item.user_id)}</code>\n"
-            f"💰 مبلغ پرداختی: <b>{int(item.paid_amount):,} تومان</b>\n"
+            f"💰 قیمت اصلی: <b>{int(getattr(item, 'base_price', 0) or item.paid_amount):,} تومان</b>\n"
+            f"🏷️ درصد تخفیف: <b>{float(getattr(item, 'discount_percent', 0) or 0):g}٪</b>\n"
+            f"💸 مبلغ تخفیف: <b>{int(getattr(item, 'discount_amount', 0) or 0):,} تومان</b>\n"
+            f"✅ مبلغ پرداختی: <b>{int(item.paid_amount):,} تومان</b>\n"
             f"📅 تاریخ: <b>{created}</b>\n"
             f"📌 وضعیت: <b>{escape(item.status)}</b>\n\n"
             f"<b>محتویات محصول:</b>\n{_format_payload(payload)}")
@@ -1275,12 +1496,22 @@ async def _owner_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
         await query.answer("وضعیت فروش تغییر کرد.", show_alert=True)
         await _owner_config(query, session, category, key)
         return
+    if action == "discount_remove" and len(parts) >= 5:
+        category, key = parts[3], parts[4]
+        conf = _get_config(catalog, category, key)
+        if conf is None:
+            await query.answer("❌ مورد پیدا نشد.", show_alert=True); return
+        conf["discount_percent"] = 0
+        _save_catalog(session, catalog)
+        await query.answer("✅ تخفیف حذف شد.", show_alert=True)
+        await _owner_config(query, session, category, key)
+        return
     if action == "set" and len(parts) >= 6:
         category, key, field = parts[3], parts[4], parts[5]
         conf = _get_config(catalog, category, key)
         if conf is None:
             await query.answer("❌ مورد پیدا نشد.", show_alert=True); return
-        labels = {"unit_amount": "مقدار واحد قیمت‌گذاری", "unit_price": "قیمت به تومان", "min": "حداقل خرید", "max": "حداکثر خرید (۰ یعنی بدون سقف)", "price": "قیمت تیم به تومان"}
+        labels = {"unit_amount": "مقدار واحد قیمت‌گذاری", "unit_price": "قیمت به تومان", "min": "حداقل خرید", "max": "حداکثر خرید (۰ یعنی بدون سقف)", "price": "قیمت تیم به تومان", "discount_percent": "درصد تخفیف (۰ تا ۱۰۰؛ صفر برای حذف)"}
         current = conf.get(field, 0)
         prompt = (f"✏️ <b>{escape(labels.get(field, field))}</b>\n\nمقدار فعلی: <b>{current}</b>\n\nمقدار جدید را به‌صورت عدد مثبت ارسال کنید. برای حداکثر خرید، عدد ۰ یعنی بدون سقف.")
         state = {"mode": "config_value", "category": category, "key": key, "field": field}
@@ -1341,11 +1572,21 @@ async def _owner_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
         conf = _get_config(catalog, category, key); plan = _find_plan(conf or {}, pid)
         if not plan:
             await query.answer("❌ پلن پیدا نشد.", show_alert=True); return
-        labels = {"name": "نام جدید پلن", "amount": "مقدار جدید پلن", "price": "قیمت جدید پلن"}
+        labels = {"name": "نام جدید پلن", "amount": "مقدار جدید پلن", "price": "قیمت اصلی جدید پلن", "discount_percent": "درصد تخفیف پلن (۰ تا ۱۰۰؛ صفر برای حذف)"}
         prompt = f"✏️ <b>{labels.get(field, 'ویرایش پلن')}</b>\n\nمقدار فعلی: <b>{escape(str(plan.get(field, '')))}</b>\n\nمقدار جدید را ارسال کنید."
         state = {"mode": "plan_edit", "category": category, "key": key, "plan_id": pid, "field": field, "page": page}
         prompt, markup = _start_input(context, state, query, prompt, _owner_cb("plan", category, key, pid, page))
         await query.answer(); await _edit(query, prompt, markup); _register(query); return
+    if action == "plan_discount_remove" and len(parts) >= 6:
+        category, key, pid = parts[3], parts[4], parts[5]
+        page = int(parts[6]) if len(parts) >= 7 else 1
+        conf = _get_config(catalog, category, key); plan = _find_plan(conf or {}, pid)
+        if not plan:
+            await query.answer("❌ پلن پیدا نشد.", show_alert=True); return
+        plan["discount_percent"] = 0
+        _save_catalog(session, catalog)
+        await query.answer("✅ تخفیف پلن حذف شد.", show_alert=True)
+        await _owner_plan_detail(query, session, category, key, pid, page); return
     if action == "plan_toggle" and len(parts) >= 6:
         category, key, pid = parts[3], parts[4], parts[5]
         page = int(parts[6]) if len(parts) >= 7 else 1
@@ -1500,12 +1741,21 @@ async def _owner_callback(update: Update, context: ContextTypes.DEFAULT_TYPE, qu
         _save_catalog(session, catalog)
         category = "bundles" if product.get("kind") == "bundle" else "events"
         await query.answer("محصول حذف شد.", show_alert=True); await _owner_category(query, session, category); return
+    if action == "custom_discount_remove" and len(parts) >= 4:
+        product_id = parts[3]
+        product = _find_custom(catalog, product_id)
+        if not product:
+            await query.answer("❌ محصول پیدا نشد.", show_alert=True); return
+        product["discount_percent"] = 0
+        _save_catalog(session, catalog)
+        await query.answer("✅ تخفیف محصول حذف شد.", show_alert=True)
+        await _owner_custom_detail(query, session, product_id); return
     if action == "custom_set" and len(parts) >= 5:
         product_id, field = parts[3], parts[4]
         product = _find_custom(catalog, product_id)
         if not product:
             await query.answer("❌ محصول پیدا نشد.", show_alert=True); return
-        label = {"name": "نام جدید", "price": "قیمت جدید به تومان", "description": "توضیحات جدید"}.get(field, "مقدار جدید")
+        label = {"name": "نام جدید", "price": "قیمت جدید به تومان", "description": "توضیحات جدید", "discount_percent": "درصد تخفیف (۰ تا ۱۰۰؛ صفر برای حذف)"}.get(field, "مقدار جدید")
         prompt = f"✏️ <b>{label}</b>\n\nمقدار فعلی: <b>{escape(str(product.get(field, '')))}</b>\n\nمقدار جدید را ارسال کنید."
         state = {"mode": "custom_edit", "product_id": product_id, "field": field}
         prompt, markup = _start_input(context, state, query, prompt, _owner_cb("custom", product_id))
@@ -1717,7 +1967,7 @@ def _purchase_name(payload, fallback="محصول فروشگاه"):
     return fallback
 
 
-async def _set_pending_purchase(query, context, uid, name, category, payload, price, product_id=None, session=None, back_callback=None, original_price=0):
+async def _set_pending_purchase(query, context, uid, name, category, payload, price, product_id=None, session=None, back_callback=None, original_price=0, base_price=None, discount_percent=0):
     price = int(price)
     if price <= 0:
         await query.answer("❌ قیمت این محصول هنوز توسط اونر تنظیم نشده است.", show_alert=True)
@@ -1725,10 +1975,19 @@ async def _set_pending_purchase(query, context, uid, name, category, payload, pr
     if price > 9_000_000_000_000_000_000:
         await query.answer("❌ مبلغ محصول خارج از محدوده مجاز است.", show_alert=True)
         return
+    base = int(price if base_price is None else base_price)
+    pct = max(0.0, min(100.0, float(discount_percent or 0)))
+    expected_final, discount_amount = _discounted_price(base, pct)
+    # The value charged is always recomputed from the stored base price and percentage.
+    price = expected_final
+    if price <= 0:
+        await query.answer("❌ قیمت نهایی محصول باید بیشتر از صفر باشد.", show_alert=True)
+        return
     context.user_data["robot_store_pending_purchase"] = {
         "user_id": int(uid), "name": str(name), "category": str(category),
-        "payload": payload, "price": price, "product_id": product_id,
-        "back_callback": back_callback,
+        "payload": payload, "price": price, "base_price": base,
+        "discount_percent": pct, "discount_amount": discount_amount,
+        "product_id": product_id, "back_callback": back_callback,
         "original_price": max(0, int(original_price or 0)),
         "purchase_token": uuid.uuid4().hex[:16],
     }
@@ -1740,9 +1999,15 @@ async def _set_pending_purchase(query, context, uid, name, category, payload, pr
             wallet = ensure_wallet(temp, uid)
             balance = int(wallet.balance or 0)
     detail = _format_payload(payload)
-    original_price = int(context.user_data["robot_store_pending_purchase"].get("original_price", 0) or 0)
-    price_lines = (f"💎 قیمت واقعی محصولات: <s>{format_amount(original_price)} تومان</s>\n"
-                   f"🎁 قیمت بسته: <b>{format_amount(price)} تومان</b>\n") if original_price > 0 else f"💰 مبلغ پرداختی: <b>{format_amount(price)} تومان</b>\n"
+    pending = context.user_data["robot_store_pending_purchase"]
+    original_price = int(pending.get("original_price", 0) or 0)
+    price_lines = ""
+    if original_price > 0:
+        price_lines += f"💎 ارزش واقعی محتویات: <b>{format_amount(original_price)} تومان</b>\n"
+    price_lines += (f"💰 قیمت اصلی: <b>{format_amount(pending['base_price'])} تومان</b>\n"
+                    f"🏷️ درصد تخفیف: <b>{float(pending['discount_percent']):g}٪</b>\n"
+                    f"💸 مبلغ تخفیف: <b>{format_amount(pending['discount_amount'])} تومان</b>\n"
+                    f"✅ قیمت نهایی: <b>{format_amount(price)} تومان</b>\n")
     text = ("🧾 <b>تأیید خرید</b>\n━━━━━━━━━━━━━━━━━━\n"
             f"📦 محصول: <b>{escape(str(name))}</b>\n"
             f"{detail}\n\n"
@@ -1807,11 +2072,13 @@ async def _user_item_view(query, uid, category, key, session, *, answer=True):
     rows = []
     unit_price = int(conf.get("unit_price", 0) or 0)
     if unit_price > 0:
+        final_unit_price, unit_discount = _discounted_price(unit_price, conf.get("discount_percent", 0))
         if category in {"missiles", "missile_level"}:
-            lines.append(f"💰 قیمت هر موشک: <b>{unit_price:,} تومان</b>")
+            unit_label = "موشک"
+            lines.append(f"💰 قیمت اصلی هر موشک: <s>{unit_price:,} تومان</s>\n🏷️ تخفیف: <b>{float(conf.get('discount_percent', 0) or 0):g}٪</b> — 💸 {unit_discount:,} تومان\n✅ قیمت نهایی هر موشک: <b>{final_unit_price:,} تومان</b>")
         else:
             unit_label = {"shields": "ساعت", "population": "شهروند", "leadership": "واحد تجربه", "missile_level": "موشک"}.get(category, "واحد")
-            lines.append(f"💰 هر <b>{int(conf.get('unit_amount', 1) or 1):,} {unit_label}</b>: <b>{unit_price:,} تومان</b>")
+            lines.append(f"💰 قیمت اصلی هر <b>{int(conf.get('unit_amount', 1) or 1):,} {unit_label}</b>: <s>{unit_price:,} تومان</s>\n🏷️ تخفیف: <b>{float(conf.get('discount_percent', 0) or 0):g}٪</b> — 💸 {unit_discount:,} تومان\n✅ قیمت نهایی: <b>{final_unit_price:,} تومان</b>")
         minimum = int(conf.get("min", 1) or 1)
         maximum = int(conf.get("max", 0) or 0)
         lines.append(f"📉 حداقل خرید: <b>{minimum:,}</b>")
@@ -1822,7 +2089,10 @@ async def _user_item_view(query, uid, category, key, session, *, answer=True):
         lines.append("\n<b>📦 پلن‌های آماده:</b>")
         for plan in plans:
             unit_label = {"shields": "ساعت", "missiles": "موشک", "missile_level": "موشک", "population": "شهروند", "leadership": "واحد تجربه"}.get(category, "واحد")
-            rows.append([_btn(f"{str(plan.get('name') or 'پلن')[:24]} — {int(plan.get('amount', 0) or 0):,} {unit_label} | {int(plan.get('price', 0) or 0):,} تومان", _uid_cb(uid, "plan", category, key, plan.get("id")))])
+            plan_final, _plan_discount = _discounted_price(plan.get("price", 0), plan.get("discount_percent", 0))
+            plan_pct = float(plan.get("discount_percent", 0) or 0)
+            plan_price_label = f"{plan_final:,} تومان" + (f" ({plan_pct:g}٪ تخفیف)" if plan_pct > 0 else "")
+            rows.append([_btn(f"{str(plan.get('name') or 'پلن')[:24]} — {int(plan.get('amount', 0) or 0):,} {unit_label} | {plan_price_label}", _uid_cb(uid, "plan", category, key, plan.get("id")))])
     lines.append("\nتمام خریدها به کیف محصولات اضافه می‌شوند.")
     rows.append([_btn("🔙 برگشت", _uid_cb(uid, "cat", category), "danger")])
     if answer:
@@ -1840,15 +2110,18 @@ async def _user_plan_purchase(query, context, uid, category, key, plan_id, sessi
     if not conf or not conf.get("enabled") or not plan or not plan.get("enabled", True):
         await query.answer("❌ این پلن در دسترس نیست.", show_alert=True); return
     amount = int(plan.get("amount", 0) or 0)
-    price = int(plan.get("price", 0) or 0)
-    if amount <= 0 or price <= 0:
+    base_price = int(plan.get("price", 0) or 0)
+    percent = float(plan.get("discount_percent", 0) or 0)
+    price, _ = _discounted_price(base_price, percent)
+    if amount <= 0 or base_price <= 0 or price <= 0:
         await query.answer("❌ اطلاعات قیمت‌گذاری پلن کامل نیست.", show_alert=True); return
     payload = _make_payload(category, key, amount, session)
     name = f"{_get_config_title(category, key, session)} — {plan.get('name', 'پلن')}"
     await query.answer()
     await _set_pending_purchase(query, context, uid, name, category, payload, price,
                                 f"plan:{category}:{key}:{plan_id}", session=session,
-                                back_callback=_uid_cb(uid, "item", category, key))
+                                back_callback=_uid_cb(uid, "item", category, key),
+                                base_price=base_price, discount_percent=percent)
 
 
 async def _user_custom_product(query, context, uid, product_id, session):
@@ -1858,14 +2131,19 @@ async def _user_custom_product(query, context, uid, product_id, session):
         await query.answer("❌ این محصول در دسترس نیست یا قیمت بسته تعیین نشده است.", show_alert=True); return
     payload = {"kind": product.get("kind"), "components": list(product.get("components", [])), "description": product.get("description", "")}
     name = str(product.get("name") or "محصول")
-    price = int(product.get("price", 0) or 0)
+    base_price = int(product.get("price", 0) or 0)
+    percent = float(product.get("discount_percent", 0) or 0)
+    price, _ = _discounted_price(base_price, percent)
+    if price <= 0:
+        await query.answer("❌ قیمت نهایی این محصول باید بیشتر از صفر باشد.", show_alert=True); return
     await query.answer()
     back_category = "events" if product.get("kind") == "event" else "bundles"
     await _set_pending_purchase(query, context, uid, name,
                                 "event" if product.get("kind") == "event" else "bundle",
                                 payload, price, f"custom:{product_id}", session=session,
                                 back_callback=_uid_cb(uid, "cat", back_category),
-                                original_price=int(product.get("original_price", 0) or 0))
+                                original_price=int(product.get("original_price", 0) or 0),
+                                base_price=base_price, discount_percent=percent)
 
 
 async def _user_team_purchase(query, context, uid, team_number, session):
@@ -1877,10 +2155,14 @@ async def _user_team_purchase(query, context, uid, team_number, session):
     if int(team_number) < 2 or int(team_number) > int(team_cfg.get("max_teams", 10) or 10):
         await query.answer("❌ این تیم در تنظیمات بازی فعال نیست.", show_alert=True); return
     payload = {"kind": "team", "team_number": int(team_number)}
+    base_price = int(conf["price"])
+    percent = float(conf.get("discount_percent", 0) or 0)
+    price, _ = _discounted_price(base_price, percent)
     await query.answer()
     await _set_pending_purchase(query, context, uid, _purchase_name(payload), "team", payload,
-                                int(conf["price"]), f"team:{team_number}", session=session,
-                                back_callback=_uid_cb(uid, "cat", "teams"))
+                                price, f"team:{team_number}", session=session,
+                                back_callback=_uid_cb(uid, "cat", "teams"),
+                                base_price=base_price, discount_percent=percent)
 
 
 async def _user_custom_amount_prompt(query, context, uid, category, key, session):
@@ -1935,6 +2217,8 @@ async def _confirm_purchase(query, context, uid, session, expected_token=None):
         return
     price = int(pending.get("price", 0) or 0)
     ensure_wallet(session, uid)
+    # Migrate only the legacy stock before inserting this new order, preventing the new order from being counted twice.
+    _migrate_legacy_bag(session)
     now = datetime.utcnow()
     result = session.execute(
         update(Wallet)
@@ -1957,11 +2241,16 @@ async def _confirm_purchase(query, context, uid, session, expected_token=None):
         product_category=str(pending.get("category") or "other")[:48],
         payload_json=json.dumps(pending.get("payload") or {}, ensure_ascii=False),
         paid_amount=price,
+        base_price=int(pending.get("base_price", price) or price),
+        discount_percent=float(pending.get("discount_percent", 0) or 0),
+        discount_amount=int(pending.get("discount_amount", 0) or 0),
         status="available",
         created_at=now,
     )
     session.add(inventory)
     try:
+        session.flush()
+        _add_payload_to_stock(session, uid, pending.get("payload") or {})
         session.flush()
     except IntegrityError:
         # A unique purchase token makes a rapid/double callback idempotent.
@@ -1975,9 +2264,12 @@ async def _confirm_purchase(query, context, uid, session, expected_token=None):
     context.user_data.pop("robot_store_pending_purchase", None)
     text = ("✅ <b>خرید با موفقیت انجام شد.</b>\n\n"
             f"📦 محصول: <b>{escape(inventory.product_name)}</b>\n"
-            f"💰 مبلغ پرداخت‌شده: <b>{format_amount(price)} تومان</b>\n"
+            f"💰 قیمت اصلی: <b>{int(inventory.base_price):,} تومان</b>\n"
+            f"🏷️ درصد تخفیف: <b>{float(inventory.discount_percent):g}٪</b>\n"
+            f"💸 مبلغ تخفیف: <b>{int(inventory.discount_amount):,} تومان</b>\n"
+            f"✅ مبلغ پرداخت‌شده: <b>{format_amount(price)} تومان</b>\n"
             f"👛 موجودی جدید کیف پول: <b>{format_amount(balance_after)} تومان</b>\n\n"
-            "محصول در کیف محصولات شما ذخیره شد. فعلاً امکان اعمال آن روی کشور وجود ندارد.")
+            "موجودی محصول به انبار کیف محصولات اضافه شد و از بخش کیف می‌توانید آن را به کشور خود منتقل کنید.")
     await query.answer("✅ خرید ثبت شد.", show_alert=True)
     await _edit(query, text, _markup([
         [_btn("🛍️ بازگشت به فروشگاه", _uid_cb(uid, "home"), "primary")],
@@ -1993,7 +2285,13 @@ async def _user_callback(update, context, query, data, session):
     if uid != int(query.from_user.id):
         await query.answer("⛔ این فروشگاه متعلق به کاربر دیگری است.", show_alert=True); return
     action = parts[3]
-    if action in {"home", "cat", "item", "missile_level", "custom", "plan", "team", "custom_product", "confirm_purchase", "bag", "bagitem"}:
+    store_actions = {"home", "cat", "item", "missile_level", "custom", "plan", "team", "custom_product", "confirm_purchase"}
+    if action in store_actions:
+        from services.game import get_user_countries, get_default_country
+        current_user = session.scalar(select(User).where(User.telegram_id == int(uid)))
+        gate_error = _country_access_error(session, current_user) if current_user else "ابتدا /start را اجرا کنید."
+        if gate_error:
+            await query.answer(gate_error, show_alert=True); return
         current_catalog = _catalog(session)
         if not current_catalog.get("enabled", True):
             await query.answer("🔴 فروشگاه محصولات فعلاً غیرفعال است.", show_alert=True); return
@@ -2040,9 +2338,126 @@ async def _user_callback(update, context, query, data, session):
         context.user_data.pop("robot_store_pending_purchase", None)
         await query.answer("خرید لغو شد.", show_alert=True)
         await _restore_user_store_back(query, uid, back_callback, session); return
+    if action == "history":
+        await _user_history_page(query, uid, session, 1); return
+    if action == "history_page" and len(parts) >= 5:
+        await _user_history_page(query, uid, session, int(parts[4])); return
+    if action == "history_item" and len(parts) >= 6:
+        await _user_purchase_detail(query, uid, int(parts[4]), int(parts[5]), session); return
     if action == "bag" and len(parts) >= 5:
         context.user_data.pop("robot_store_state", None)
         await _send_bag_page(query, context, session, uid, int(parts[4]), reply=False); return
+    if action == "stockitem" and len(parts) >= 5:
+        _migrate_legacy_bag(session)
+        stock_id = int(parts[4]); bag_page = int(parts[5]) if len(parts) >= 6 else 1
+        stock = session.scalar(select(ProductStock).where(ProductStock.id == stock_id, ProductStock.user_id == uid, ProductStock.amount > 0))
+        if stock is None:
+            await query.answer("❌ موجودی پیدا نشد.", show_alert=True); return
+        amount = int(stock.amount) if float(stock.amount).is_integer() else round(float(stock.amount), 2)
+        await query.answer()
+        await _edit(query, (f"🎒 <b>{escape(stock.product_name)}</b>\n━━━━━━━━━━━━━━━━━━\n"
+                            f"📦 موجودی قابل انتقال: <b>{amount:,} {escape(stock.unit)}</b>\n\n"
+                            "برای انتقال این موجودی به یکی از کشورهای خودتان، گزینه زیر را انتخاب کنید."),
+                     _markup([[_btn("🌍 انتقال به کشور", _uid_cb(uid, "transfer_start", stock_id), "success")],
+                              [_btn("🔙 برگشت به کیف محصولات", _uid_cb(uid, "bag", bag_page), "danger")]]))
+        _register(query); return
+    if action == "transfer_start" and len(parts) >= 5:
+        stock_id = int(parts[4]); stock = session.scalar(select(ProductStock).where(ProductStock.id == stock_id, ProductStock.user_id == uid, ProductStock.amount > 0))
+        if stock is None:
+            await query.answer("❌ موجودی پیدا نشد.", show_alert=True); return
+        from services.game import get_user_countries
+        countries = get_user_countries(session, user)
+        if not countries:
+            await query.answer("🌍 شما هیچ کشوری برای انتقال ندارید.", show_alert=True); return
+        rows = [[_btn(f"🌍 {c.title}", _uid_cb(uid, "transfer_country", stock_id, c.id))] for c in countries]
+        rows.append([_btn("🔙 برگشت", _uid_cb(uid, "stockitem", stock_id, 1), "danger")])
+        await query.answer(); await _edit(query, f"🌍 <b>انتخاب کشور مقصد</b>\n\nموجودی: <b>{escape(stock.product_name)}</b> — {stock.amount:g} {escape(stock.unit)}\nکشور مقصد را انتخاب کنید:", _markup(rows)); _register(query); return
+    if action == "transfer_country" and len(parts) >= 6:
+        stock_id, country_id = int(parts[4]), int(parts[5])
+        stock = session.scalar(select(ProductStock).where(ProductStock.id == stock_id, ProductStock.user_id == uid, ProductStock.amount > 0))
+        from services.game import get_user_countries
+        countries = get_user_countries(session, user)
+        country = next((c for c in countries if int(c.id) == country_id), None)
+        if stock is None or country is None:
+            await query.answer("❌ موجودی یا کشور مقصد معتبر نیست.", show_alert=True); return
+        state = {"mode": "user_transfer_amount", "stock_id": stock_id, "country_id": country_id,
+                 "stock_name": stock.product_name, "available": float(stock.amount), "unit": stock.unit,
+                 "chat_id": int(query.message.chat_id), "panel_message_id": int(query.message.message_id)}
+        context.user_data["robot_store_state"] = state
+        await query.answer()
+        await _edit(query, (f"🔢 <b>مقدار انتقال</b>\n\nمحصول: <b>{escape(stock.product_name)}</b>\n"
+                            f"کشور مقصد: <b>{escape(country.title)}</b>\nموجودی قابل انتقال: <b>{stock.amount:g} {escape(stock.unit)}</b>\n\n"
+                            "مقدار موردنظر را ارسال کنید."), _markup([[_btn("🔙 برگشت", _uid_cb(uid, "transfer_start", stock_id), "danger")]]))
+        _register(query); return
+    if action == "transfer_cancel":
+        context.user_data.pop("robot_store_pending_transfer", None)
+        await query.answer("انتقال لغو شد.", show_alert=True)
+        await _send_bag_page(query, context, session, uid, 1, reply=False); return
+    if action == "transfer_confirm" and len(parts) >= 5:
+        pending = context.user_data.get("robot_store_pending_transfer")
+        token = str(parts[4])
+        if not isinstance(pending, dict) or int(pending.get("user_id", 0)) != uid or str(pending.get("token")) != token:
+            await query.answer("این درخواست انتقال منقضی شده است.", show_alert=True); return
+        stock_id = int(pending["stock_id"]); country_id = int(pending["country_id"]); amount = float(pending["amount"])
+        stock = session.scalar(select(ProductStock).where(ProductStock.id == stock_id, ProductStock.user_id == uid))
+        from services.game import get_user_countries, add_missile_to_inventory
+        countries = get_user_countries(session, user)
+        country = next((c for c in countries if int(c.id) == country_id), None)
+        if stock is None or country is None or amount <= 0:
+            context.user_data.pop("robot_store_pending_transfer", None)
+            await query.answer("❌ اطلاعات انتقال معتبر نیست.", show_alert=True); return
+        result = session.execute(update(ProductStock).where(
+            ProductStock.id == stock_id, ProductStock.user_id == uid, ProductStock.amount >= amount
+        ).values(amount=ProductStock.amount - amount, updated_at=datetime.utcnow()))
+        if int(result.rowcount or 0) != 1:
+            await query.answer("❌ موجودی برای این انتقال کافی نیست.", show_alert=True); return
+        payload = json.loads(stock.payload_json or "{}")
+        kind = payload.get("kind")
+        if kind == "resource":
+            field = {"money": "money", "metal": "metal", "fuel": "fuel", "uranium": "uranium"}.get(payload.get("resource"))
+            if not field:
+                session.rollback(); await query.answer("❌ منبع نامعتبر است.", show_alert=True); return
+            if not bool(getattr(country, f"infinite_{field}", False)):
+                setattr(country, field, float(getattr(country, field) or 0) + amount)
+        elif kind == "population":
+            account = session.scalar(select(BankAccount).where(BankAccount.country_id == country.id))
+            if account is None:
+                account = BankAccount(country_id=country.id, citizens=1_000_000); session.add(account); session.flush()
+            account.citizens = int(account.citizens or 0) + int(amount)
+        elif kind == "leadership":
+            country.leadership_experience = float(country.leadership_experience or 0) + amount
+        elif kind == "shield":
+            from services.economy import adjust_active_shield_time
+            typ = str(payload.get("shield_type"))
+            ok, actual, _expires = adjust_active_shield_time(
+                session, int(country.leader_user_id), typ, amount,
+                country_id=int(country.id) if typ == "continental" else None,
+            )
+            if not ok:
+                session.rollback(); await query.answer("❌ انتقال سپر انجام نشد.", show_alert=True); return
+        elif kind == "missile":
+            add_missile_to_inventory(session, country.id, payload.get("missile_id"), int(payload.get("level", 1) or 1), int(amount))
+        elif kind == "team":
+            from services.construction_teams import grant_team
+            # A country can own a given team number only once. Failure rolls back
+            # the stock decrement, so the purchased item remains in the user's bag.
+            granted, _reason = grant_team(session, country, int(payload.get("team_number", 0) or 0))
+            if not granted:
+                session.rollback()
+                await query.answer("❌ این کشور از قبل این تیم را دارد یا تیم در تنظیمات فعال نیست؛ موجودی کیف کسر نشد.", show_alert=True)
+                return
+        else:
+            session.rollback(); await query.answer("❌ نوع محصول قابل انتقال نیست.", show_alert=True); return
+        remaining = session.scalar(select(ProductStock.amount).where(ProductStock.id == stock_id))
+        if remaining is not None and float(remaining) <= 0.0000001:
+            session.delete(stock)
+        session.commit()
+        context.user_data.pop("robot_store_pending_transfer", None)
+        context.user_data.pop("robot_store_state", None)
+        await query.answer("✅ موجودی با موفقیت به کشور منتقل شد.", show_alert=True)
+        await _edit(query, f"✅ <b>انتقال با موفقیت انجام شد.</b>\n\n📦 محصول: <b>{escape(stock.product_name)}</b>\n🌍 کشور مقصد: <b>{escape(country.title)}</b>\n📥 مقدار منتقل‌شده: <b>{amount:g} {escape(stock.unit)}</b>",
+                    _markup([[_btn("🎒 بازگشت به کیف محصولات", _uid_cb(uid, "bag", 1), "success")]]))
+        _register(query); return
     if action == "bagitem" and len(parts) >= 5:
         item_id = int(parts[4])
         bag_page = int(parts[5]) if len(parts) >= 6 else 1
@@ -2188,14 +2603,22 @@ async def _message_purchase_confirmation(context, message, uid, pending, panel_s
             temp.commit()
     detail = _format_payload(pending.get("payload") or {})
     original_price = int(pending.get("original_price", 0) or 0)
-    price_lines = (f"💎 قیمت واقعی محصولات: <s>{format_amount(original_price)} تومان</s>\n"
-                   f"🎁 قیمت بسته: <b>{format_amount(price)} تومان</b>\n") if original_price > 0 else f"💰 مبلغ پرداختی: <b>{format_amount(price)} تومان</b>\n"
+    base_price = int(pending.get("base_price", price) or price)
+    percent = float(pending.get("discount_percent", 0) or 0)
+    discount = int(pending.get("discount_amount", max(0, base_price-price)) or 0)
+    price_lines = ""
+    if original_price > 0:
+        price_lines += f"💎 ارزش واقعی محتویات: <b>{format_amount(original_price)} تومان</b>\n"
+    price_lines += (f"💰 قیمت اصلی: <b>{format_amount(base_price)} تومان</b>\n"
+                    f"🏷️ درصد تخفیف: <b>{percent:g}٪</b>\n"
+                    f"💸 مبلغ تخفیف: <b>{format_amount(discount)} تومان</b>\n"
+                    f"✅ قیمت نهایی: <b>{format_amount(price)} تومان</b>\n")
     text = ("🧾 <b>تأیید خرید</b>\n━━━━━━━━━━━━━━━━━━\n"
             f"📦 محصول: <b>{escape(str(pending.get('name') or 'محصول'))}</b>\n{detail}\n\n"
             f"{price_lines}"
             f"👛 موجودی فعلی: <b>{format_amount(balance)} تومان</b>\n"
             f"👛 موجودی پس از خرید: <b>{format_amount(max(0, balance-price))} تومان</b>\n\n"
-            "با تأیید، محصول به کیف محصولات اضافه می‌شود و فعلاً روی کشور اعمال نخواهد شد.")
+            "با تأیید، محصول به کیف محصولات اضافه می‌شود و از بخش کیف می‌توانید موجودی را به کشور منتقل کنید.")
     purchase_token = str(pending.get("purchase_token") or uuid.uuid4().hex[:16])
     pending["purchase_token"] = purchase_token
     context.user_data["robot_store_pending_purchase"] = pending
@@ -2246,6 +2669,37 @@ async def handle_store_message(update: Update, context: ContextTypes.DEFAULT_TYP
     except Exception:
         pass
 
+    if mode == "user_transfer_amount":
+        try:
+            stock_id = int(state.get("stock_id")); country_id = int(state.get("country_id"))
+            stock = session.scalar(select(ProductStock).where(ProductStock.id == stock_id, ProductStock.user_id == uid))
+            if stock is None or float(stock.amount or 0) <= 0:
+                raise ValueError("موجودی در کیف شما پیدا نشد.")
+            amount = _parse_number(raw, integer=(stock.unit != "ساعت"))
+            if amount <= 0 or amount > float(stock.amount):
+                raise ValueError(f"مقدار باید بیشتر از صفر و حداکثر {float(stock.amount):g} {stock.unit} باشد.")
+            from services.game import get_user_countries
+            country = next((c for c in get_user_countries(session, user) if int(c.id) == country_id), None)
+            if country is None:
+                raise ValueError("کشور مقصد دیگر در فهرست کشورهای شما نیست.")
+            token = uuid.uuid4().hex[:16]
+            context.user_data["robot_store_pending_transfer"] = {"user_id": uid, "stock_id": stock_id,
+                "country_id": country_id, "amount": float(amount), "token": token}
+            context.user_data.pop("robot_store_state", None)
+            text = ("🔎 <b>تأیید انتقال موجودی</b>\n━━━━━━━━━━━━━━━━━━\n"
+                    f"📦 محصول: <b>{escape(stock.product_name)}</b>\n"
+                    f"🌍 کشور مقصد: <b>{escape(country.title)}</b>\n"
+                    f"📤 مقدار انتقال: <b>{amount:g} {escape(stock.unit)}</b>\n"
+                    f"📦 موجودی پس از انتقال: <b>{float(stock.amount)-float(amount):g} {escape(stock.unit)}</b>\n\n"
+                    "آیا انتقال انجام شود؟")
+            await _edit_saved_panel(context, state, text, _markup([
+                [_btn("✅ تأیید انتقال", _uid_cb(uid, "transfer_confirm", token), "success")],
+                [_btn("❌ لغو", _uid_cb(uid, "transfer_cancel"), "danger")],
+            ]), message)
+        except Exception as exc:
+            await message.reply_text(f"❌ مقدار انتقال معتبر نیست: {escape(str(exc))}", parse_mode="HTML")
+        return True
+
     if mode == "user_custom_amount":
         category, key = state.get("category"), str(state.get("key"))
         catalog = _catalog(session)
@@ -2265,9 +2719,11 @@ async def handle_store_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 raise ValueError(f"حداکثر خرید {maximum:,} است.")
             unit_amount = 1 if category in {"missiles", "missile_level"} else max(1, int(conf.get("unit_amount", 1) or 1))
             unit_price = int(conf.get("unit_price", 0) or 0)
-            price = (amount * unit_price + unit_amount - 1) // unit_amount
-            if price <= 0:
-                raise ValueError("قیمت این محصول هنوز تنظیم نشده است.")
+            base_price = (amount * unit_price + unit_amount - 1) // unit_amount
+            percent = float(conf.get("discount_percent", 0) or 0)
+            price, discount_amount = _discounted_price(base_price, percent)
+            if base_price <= 0 or price <= 0:
+                raise ValueError("قیمت نهایی این محصول باید بیشتر از صفر باشد.")
             if price > 9_000_000_000_000_000_000:
                 raise ValueError("مبلغ محاسبه‌شده از محدوده مجاز بیشتر است.")
             payload = _make_payload(category, key, amount, session)
@@ -2278,7 +2734,9 @@ async def handle_store_message(update: Update, context: ContextTypes.DEFAULT_TYP
         panel_state = dict(state)
         context.user_data.pop("robot_store_state", None)
         pending = {"user_id": uid, "name": name, "category": category, "payload": payload,
-                   "price": price, "product_id": f"custom-amount:{category}:{key}",
+                   "price": price, "base_price": base_price, "discount_percent": percent,
+                   "discount_amount": discount_amount,
+                   "product_id": f"custom-amount:{category}:{key}",
                    "back_callback": _uid_cb(uid, "item", category, key),
                    "purchase_token": uuid.uuid4().hex[:16]}
         context.user_data["robot_store_pending_purchase"] = pending
@@ -2294,17 +2752,19 @@ async def handle_store_message(update: Update, context: ContextTypes.DEFAULT_TYP
             await message.reply_text("❌ تنظیمات این محصول پیدا نشد.")
             return True
         try:
-            if field in {"unit_price", "price"}:
+            if field in {"unit_price", "price", "discount_percent"}:
                 value = _parse_number(raw, integer=True) if raw not in {"0", "۰"} else 0
             else:
                 value = _parse_number(raw, integer=True) if raw not in {"0", "۰"} else 0
+            if field == "discount_percent" and not 0 <= value <= 100:
+                raise ValueError("درصد تخفیف باید بین ۰ تا ۱۰۰ باشد.")
             if field == "unit_amount" and value < 1:
                 raise ValueError("مقدار پایه باید حداقل ۱ باشد.")
             if field == "min" and value < 1:
                 raise ValueError("حداقل خرید باید حداقل ۱ باشد.")
             if field == "max" and value > 0 and value < int(conf.get("min", 1) or 1):
                 raise ValueError("حداکثر خرید نمی‌تواند کمتر از حداقل خرید باشد.")
-            if field not in {"unit_amount", "unit_price", "min", "max", "price"}:
+            if field not in {"unit_amount", "unit_price", "min", "max", "price", "discount_percent"}:
                 raise ValueError("فیلد نامعتبر است.")
             conf[field] = value
             _save_catalog(session, catalog)
@@ -2354,7 +2814,7 @@ async def handle_store_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 context.user_data.pop("robot_store_state", None)
                 await message.reply_text("❌ تنظیمات این محصول پیدا نشد.")
                 return True
-            conf.setdefault("plans", []).append({"id": uuid.uuid4().hex[:8], "name": state["name"], "amount": int(state["amount"]), "price": int(price), "enabled": True})
+            conf.setdefault("plans", []).append({"id": uuid.uuid4().hex[:8], "name": state["name"], "amount": int(state["amount"]), "price": int(price), "discount_percent": 0, "enabled": True})
             _save_catalog(session, catalog)
             category, key = state.get("category"), state.get("key")
             context.user_data.pop("robot_store_state", None)
@@ -2383,6 +2843,10 @@ async def handle_store_message(update: Update, context: ContextTypes.DEFAULT_TYP
                 value = _parse_number(raw, integer=True)
             elif field == "price":
                 value = _parse_number(raw, integer=True) if raw not in {"0", "۰"} else 0
+            elif field == "discount_percent":
+                value = _parse_number(raw, integer=True) if raw not in {"0", "۰"} else 0
+                if not 0 <= value <= 100:
+                    raise ValueError("درصد تخفیف باید بین ۰ تا ۱۰۰ باشد.")
             else:
                 raise ValueError("فیلد نامعتبر است.")
             plan[field] = value
@@ -2489,6 +2953,10 @@ async def handle_store_message(update: Update, context: ContextTypes.DEFAULT_TYP
                     raise ValueError("توضیحات حداکثر ۸۰۰ نویسه باشد.")
             elif field == "price":
                 value = _parse_number(raw, integer=True)
+            elif field == "discount_percent":
+                value = _parse_number(raw, integer=True) if raw not in {"0", "۰"} else 0
+                if not 0 <= value <= 100:
+                    raise ValueError("درصد تخفیف باید بین ۰ تا ۱۰۰ باشد.")
             else:
                 raise ValueError("فیلد نامعتبر است.")
             product[field] = value

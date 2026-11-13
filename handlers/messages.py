@@ -1586,17 +1586,9 @@ async def private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         country = get_context_country(session,user,message.chat_id if message else None)
 
-        # کاربر خصوصی بدون کشور پیش‌فرض فقط می‌تواند تنظیمات بازی را باز کند.
-        if (
-            update.effective_chat
-            and update.effective_chat.type == "private"
-            and country is None
-            and not is_owner(user_tg.id, OWNER_ID)
-            and not is_admin(session, user_tg.id, OWNER_ID)
-        ):
-            # این قفل فقط برای امکاناتی است که واقعاً به یک کشور فعال نیاز دارند؛
-            # تنظیمات اکانت، کیف پول و پشتیبانی نباید به‌خاطر نداشتن کشور مسدود شوند.
-            country_required_private_commands = {command_key(x) for x in (
+        # همه مسیرهای متنی و اسلش هفت بخش اقتصادی/نظامی به کشور پیش‌فرض نیاز دارند.
+        if not is_owner(user_tg.id, OWNER_ID) and not is_admin(session, user_tg.id, OWNER_ID):
+            country_required_commands = {command_key(x) for x in (
                 "بانک مرکزی", "🏦 بانک مرکزی",
                 "مرکز فرماندهی", "🏛️ مرکز فرماندهی",
                 "زرادخانه", "🏭 زرادخانه",
@@ -1613,17 +1605,24 @@ async def private_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "پول به فلز", "💰 پول به فلز", "فلز به پول", "🔩 فلز به پول",
                 "پول به سوخت", "💰 پول به سوخت", "سوخت به پول", "⛽ سوخت به پول",
                 "اورانیوم به سوخت", "☢️ اورانیوم به سوخت", "اورانیوم به پول", "☢️ اورانیوم به پول",
-                "کشور",
             )}
-            if normalized in country_required_private_commands:
-                no_country_message = (
-                    "🌍 شما هنوز هیچ کشوری ندارید. ابتدا در گروهی با دستور «شروع بازی» یک کشور ایجاد کنید."
-                    if not get_user_countries(session, user)
-                    else "❌ ابتدا از قسمت تنظیمات بازی یک کشور را به‌عنوان کشور پیش‌فرض انتخاب کنید."
-                )
-                await message.reply_text(no_country_message, reply_markup=command_keyboard(no_country=True))
-                session.commit()
-                return
+            if normalized in country_required_commands:
+                countries = get_user_countries(session, user)
+                default_country = get_default_country(session, user) if countries else None
+                if not countries:
+                    await message.reply_text(
+                        "🌍 شما هنوز هیچ کشوری ندارید. ابتدا در گروهی با دستور «شروع بازی» یک کشور ایجاد کنید.",
+                        reply_markup=command_keyboard(no_country=True),
+                    )
+                    session.commit()
+                    return
+                if default_country is None:
+                    await message.reply_text(
+                        "❌ ابتدا از قسمت تنظیمات بازی یک کشور را به‌عنوان کشور پیش‌فرض انتخاب کنید.",
+                        reply_markup=command_keyboard(no_country=True),
+                    )
+                    session.commit()
+                    return
 
         # گیت ثبت شماره تلفن بر اساس نقش
         if phone_required_for(session, is_admin_user=is_admin(session, user_tg.id, OWNER_ID), is_owner_user=is_owner(user_tg.id, OWNER_ID)) and not user.phone_number:

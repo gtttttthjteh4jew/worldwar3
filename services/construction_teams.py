@@ -270,6 +270,21 @@ def buy_next_team(session, country):
     return buy_team(session,country,quote[0])
 
 
+def grant_team(session, country, team_no):
+    """Grant a previously purchased team stock item to a country without charging again."""
+    team_no = int(team_no)
+    cfg, state, _info = get_team_status(session, country)
+    max_teams = int(cfg.get("max_teams", 10) or 10)
+    if team_no < 2 or team_no > max_teams:
+        return False, "INVALID"
+    purchased = {int(x) for x in (state.get("purchased", [1]) or [1])}
+    if team_no in purchased:
+        return False, "OWNED"
+    state["purchased"] = sorted(purchased | {team_no})
+    _save_from_cfg(session, cfg)
+    return True, team_no
+
+
 def set_max_teams(session, value):
     value=max(1,min(MAX_LIMIT,int(value)))
     cfg=get_construction_teams_config(session)
